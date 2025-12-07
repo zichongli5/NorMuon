@@ -25,7 +25,7 @@ def zeropower_via_newtonschulz5(G, steps=5):
         A = X @ X.mT
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
-    
+
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
@@ -39,7 +39,7 @@ def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_st
     if update.ndim == 4:  # for the case of conv filters
         original_shape = update.shape
         update = update.reshape(update.size(0), -1)
-    update = zeropower_via_newtonschulz5(update, steps=ns_steps).float()
+    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
     if original_shape is not None:
         update = update.reshape(original_shape)
     ################ NorMuon added ###################
