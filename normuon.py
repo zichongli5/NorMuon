@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 
 # copied from https://github.com/KellerJordan/Muon/blob/master/muon.py
-def zeropower_via_newtonschulz5(G, steps=5):
+def zeropower_via_newtonschulz5(G, steps=5, use_triton=False):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -13,6 +13,14 @@ def zeropower_via_newtonschulz5(G, steps=5):
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    if use_triton and min(G.shape[-2:]) == 512:
+        try:
+            from ns_triton import zeropower_via_newtonschulz5_triton
+        except ImportError as exc:
+            raise RuntimeError(
+                "use_triton=True for an M=512 matrix requires the optional Triton dependency"
+            ) from exc
+        return zeropower_via_newtonschulz5_triton(G, steps=steps)
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
@@ -32,14 +40,15 @@ def zeropower_via_newtonschulz5(G, steps=5):
 
 
 
-def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True):
+def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5,
+                   nesterov=True, use_triton=False):
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     original_shape = None
     if update.ndim == 4:  # for the case of conv filters
         original_shape = update.shape
         update = update.reshape(update.size(0), -1)
-    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+    update = zeropower_via_newtonschulz5(update, steps=ns_steps, use_triton=use_triton)
     update = update.to(grad.dtype)
 
     if original_shape is not None:
@@ -95,13 +104,82 @@ class NorMuon(torch.optim.Optimizer):
 
         return loss
 
+
+def _single_device_triton_step(optimizer, group):
+    """Batch same-shaped M=512 parameters for the opt-in Triton path."""
+    buckets = {}
+    for p in group["params"]:
+        if p.ndim == 2 and min(p.shape) == 512:
+            buckets.setdefault((p.shape, p.device, p.dtype), []).append(p)
+
+    handled = set()
+    for params in buckets.values():
+        if len(params) == 1:
+            continue
+        handled.update(id(p) for p in params)
+        had_grads = [p.grad is not None for p in params]
+        for p in params:
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            state = optimizer.state[p]
+            if len(state) == 0:
+                state["momentum_buffer"] = torch.zeros_like(p)
+                state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
+
+        momentum = torch.stack([optimizer.state[p]["momentum_buffer"] for p in params])
+        second_momentum = torch.stack(
+            [optimizer.state[p]["second_momentum_buffer"] for p in params]
+        )
+        updates = normuon_update(
+            torch.stack([p.grad for p in params]),
+            momentum,
+            second_momentum,
+            beta=group["momentum"],
+            beta2=group["beta2"],
+            use_triton=True,
+        )
+        for p, update, momentum_value, second_value, had_grad in zip(
+            params, updates, momentum, second_momentum, had_grads
+        ):
+            state = optimizer.state[p]
+            state["momentum_buffer"].copy_(momentum_value)
+            state["second_momentum_buffer"].copy_(second_value)
+            if group["weight_decay"] and had_grad:
+                p.mul_(1 - group["lr"] * group["weight_decay"])
+            p.add_(update, alpha=-group["lr"])
+
+    for p in group["params"]:
+        if id(p) in handled:
+            continue
+        had_grad = p.grad is not None
+        if not had_grad:
+            p.grad = torch.zeros_like(p)
+        state = optimizer.state[p]
+        if len(state) == 0:
+            state["momentum_buffer"] = torch.zeros_like(p)
+            state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
+        update = normuon_update(
+            p.grad,
+            state["momentum_buffer"],
+            state["second_momentum_buffer"],
+            beta=group["momentum"],
+            beta2=group["beta2"],
+            use_triton=p.ndim == 2 and min(p.shape) == 512,
+        )
+        if group["weight_decay"] and had_grad:
+            p.mul_(1 - group["lr"] * group["weight_decay"])
+        p.add_(update.reshape(p.shape), alpha=-group["lr"])
+
+
 # modified from https://github.com/KellerJordan/Muon/blob/master/muon.py
 class SingleDeviceNorMuon(torch.optim.Optimizer):
     """
     Muon variant for usage in non-distributed settings.
     """
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, beta2=0.95):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, beta2=0.95,
+                 use_triton=False):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2,
+                        use_triton=use_triton)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -113,6 +191,9 @@ class SingleDeviceNorMuon(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
+            if group["use_triton"]:
+                _single_device_triton_step(self, group)
+                continue
             for p in group["params"]:
                 had_grad = p.grad is not None
                 if not had_grad:
@@ -122,7 +203,7 @@ class SingleDeviceNorMuon(torch.optim.Optimizer):
                 if len(state) == 0:
                     state["momentum_buffer"] = torch.zeros_like(p)
                     state["second_momentum_buffer"] = torch.zeros_like(p[...,0:1])
-                update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"], beta=group["momentum"], beta2=group["beta2"])
+                update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"], beta=group["momentum"], beta2=group["beta2"], use_triton=group["use_triton"])
                 if group["weight_decay"] and had_grad:
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                 p.add_(update.reshape(p.shape), alpha=-group["lr"])
@@ -221,7 +302,8 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["momentum"] = group.get("momentum", 0.95)
                 group["beta2"] = group.get("beta2", 0.95)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_muon"}
+                group["use_triton"] = group.get("use_triton", False)
+                assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_muon", "use_triton"}
             else:
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
@@ -240,6 +322,9 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
 
         for group in self.param_groups:
             if group["use_muon"]:
+                if group["use_triton"]:
+                    _single_device_triton_step(self, group)
+                    continue
                 for p in group["params"]:
                     had_grad = p.grad is not None
                     if not had_grad:
@@ -249,7 +334,8 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(p)
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                     update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
-                                            beta=group["momentum"], beta2=group["beta2"])
+                                            beta=group["momentum"], beta2=group["beta2"],
+                                            use_triton=group["use_triton"])
                     if group["weight_decay"] and had_grad:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])

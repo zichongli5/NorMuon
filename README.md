@@ -15,6 +15,7 @@ pip install git+https://github.com/zichongli5/NorMuon.git
 ```
 
 `normuon.py` has no dependencies beyond PyTorch, so you can also just drop it into your project.
+The optional M=512 Triton path can be installed with `pip install ".[triton]"`.
 
 ## What's in `normuon.py`
 
@@ -40,6 +41,20 @@ param_groups = [
 ]
 optimizer = NorMuonWithAuxAdam(param_groups)
 ```
+
+CUDA workloads whose hidden matrices have a 512-element short dimension can
+opt into an all-Triton implementation of the same five-step Keller-Jordan
+Newton-Schulz iteration:
+
+```python
+from normuon import SingleDeviceNorMuonWithAuxAdam
+
+param_groups[0]["use_triton"] = True
+optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
+```
+
+The flag defaults to `False`. Shapes other than M=512 continue to use the
+original Torch implementation; requesting Triton does not change their path.
 
 The defaults (`lr=0.02`, `momentum=0.95`, `beta2=0.95`) match Muon's; in our experiments only `lr` and `weight_decay` typically need tuning, and the same values that work for Muon are a good starting point.
 

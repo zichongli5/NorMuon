@@ -13,8 +13,9 @@ setup(
     long_description_content_type="text/markdown",
     author="Zichong Li",
     url="https://github.com/zichongli5/NorMuon",
-    py_modules=["normuon"],
+    py_modules=["normuon", "ns_triton"],
     install_requires=["torch"],
+    extras_require={"triton": ["triton>=3.0.0"]},
     classifiers=[
         'Development Status :: 5 - Production/Stable',
         'Intended Audience :: Developers',
